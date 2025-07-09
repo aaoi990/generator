@@ -1,6 +1,16 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+class HeaderMixin:
+    """Mixin that adds header processing capabilities"""
+    
+    def process_headers_for_config(self, headers, custom):
+        """Process current context headers with config requirements"""
+        print("headers", headers)
+        print("custom", custom)  
+        return custom
+
+
 class BaseConfig(ABC):
     """Base class with common nginx configuration template"""
     
@@ -103,7 +113,7 @@ server {{
         """Each config type must define its location blocks"""
         pass
 
-class SecureConfig(BaseConfig):
+class SecureConfig(BaseConfig, HeaderMixin):
     """API Server with minimal customization"""
     
     def __init__(self):
@@ -115,6 +125,7 @@ class SecureConfig(BaseConfig):
         return "404"
     
     def get_error_config(self):
+        test = self.process_headers_for_config(headers, 'test')
         return f"""error handling"""
     
     def get_server_name(self, config_id):
