@@ -1,271 +1,196 @@
-from abc import ABC, abstractmethod
-from pathlib import Path
+from typing import Dict, List, Any, Callable, Tuple
+import json
 
-class HeaderMixin:
-    """Mixin that adds header processing capabilities"""
-    
-    def process_headers_for_config(self, headers, custom):
-        """Process current context headers with config requirements"""
-        print("headers", headers)
-        print("custom", custom)  
-        return custom
+# Single base template
+BASE_TEMPLATE = """user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
 
+http {{
+        sendfile on;
+        tcp_nopush on;
+        types_hash_max_size 2048;
+    
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
 
-class BaseConfig(ABC):
-    """Base class with common nginx configuration template"""
-    
-    def __init__(self):
-        self.default_port = 80
-        self.default_ssl_port = 443
-        self.enable_gzip = False
-        self.enable_security_headers = False
-        self.server_tokens = False
-    
-    @property
-    @abstractmethod
-    def config_type(self):
-        """Return a string identifying the config type"""
-        pass
-    
-    def generate(self, config_id, custom_data=None):
-        """Main template method that builds the complete config"""       
-        config_parts = []
-        
-        # Add upstream if needed
-        error_handling = self.get_error_config()
-        if error_handling:
-            config_parts.append(error_handling)
-        
-        # Add main server block
-        server_config = self.get_server_config(config_id, custom_data)
-        config_parts.append(server_config)
-        
-        return "\n".join(config_parts)
-    
-    def get_error_config(self):
-        """Override this if you need upstream configuration"""
-        return None
-    
-    
-    def get_server_config(self, config_id, custom_data):
-        """Build the main server configuration"""
-        server_tokens = self.get_server_tokens()
-        server_name = self.get_server_name(config_id)
-        listen_directive = self.get_listen_directive()
-        ssl_config = self.get_ssl_config(config_id, custom_data)
-        locations = self.get_location_blocks(config_id)
-        common_directives = self.get_common_directives()
-        
-        config = f"""
-{server_tokens}
-        
+        {tls_config}
+        {error_config}
+        {server_tokens}
+
+        access_log /var/log/nginx/access.log;
+        error_log /var/log/nginx/error.log;
+}}
+
 server {{
-    {listen_directive}
-    server_name {server_name};
+    listen 80;
+    listen 443 ssl;
+
+    ssl_certificate /etc/ssl/certs/wildcard.pem;
+    ssl_certificate_key /etc/ssl/private/wildcard.key;  
+{body_component}
+}} """
+
+class ConfigGenerator:
+    def __init__(self):
+        # Cache for generated configurations
+        self._config_cache = {}
+        self.global_headers = """
+    DEFAULT;
+    DEFAULT;
+    DEFAULT
+    """
+        
+        # Header configurations
+        self.header_configs = {
+            "001": """add_header Some headers "header values";""",       
+           
+        }
+        
+        # Component generators mapping
+        self.body_component_generators = {
+            "error_page": self._error_page_component,
+        }
+        
+        # Hash to component mapping with parameters
+        self.body_hash_map = {
+            # Error pages
+            "001": {"type": "error_page", "params": [404, "404"]},
+           
+        }
     
-{ssl_config}
-{common_directives}
-{locations}
-}}"""
+    def _error_page_component(self, code: int, page: str, header_hash) -> str:
+        """Generate error page component."""
+        header_config = self.header_configs.get(header_hash)
+        return f""" 
+    error_page {code} /{page}.html;
+
+    location = /{page}.html {{
+        {header_config}
+        root /var/www/error-pages;
+        internal;
+    }}    
+    {self.global_headers}
+    location / {{
+        {header_config}
+        return {code};
+    }}"""
+       
+    
+    def generate_tls_config(self, tls_params: Dict[str, Any]) -> str:
+        """Generate TLS configuration from parameters."""
+        domain = tls_params.get('domain')
+        ssl_protocols = tls_params.get('ssl_protocols', 'TLSv1.2 TLSv1.3')
+        cipher_suite = tls_params.get('cipher_suite')
+        hsts_enabled = tls_params.get('hsts_enabled', True)
+        
+        if not domain:
+            raise ValueError("Domain is required for TLS configuration")
+        
+        tls_config = ""
+
+        tls_config += f"""
+        ssl_protocols {ssl_protocols};"""
+        
+        # Add cipher suite if specified
+        if cipher_suite:
+            tls_config += f"""
+        ssl_ciphers {cipher_suite};
+        ssl_prefer_server_ciphers on;"""
+        else:
+            tls_config += """
+        ssl_ciphers ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256;
+        ssl_prefer_server_ciphers on;"""
+        
+        # Add HSTS if enabled
+        if hsts_enabled:
+            tls_config += """
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;"""
+        
+        return tls_config
+
+
+    def generate_body_component(self, body_hash: str, header_hash):
+        """Generate body component from hash."""
+        config = self.body_hash_map.get(body_hash)
+        if not config:
+            raise ValueError(f"Unknown body hash: {body_hash}")
+        
+        generator = self.body_component_generators[config["type"]]
+        errors = self.generate_error_codes(config["params"][0])    
+        return generator(*config["params"], header_hash), errors
+
+
+    def generate_error_codes(self, target_code):    
+        error_codes = [400, 401, 403, 405, 500, 502, 503]
+        other_codes = [code for code in error_codes if code != target_code]
+        return f"error_page {', '.join(map(str, other_codes))} = return/{target_code}"
+    
+    
+    def get_server_tokens(self, tls_params):
+        return f"server_tokens on;" if tls_params["server tokens"] == True else f"server_tokens off;" 
+    
+
+    def generate_config(self, body_hash: str, header_hash: str, tls_params: Dict[str, Any]) -> str:
+        """Generate complete nginx configuration."""        
+        body_component, errors = self.generate_body_component(body_hash, header_hash)
+        tls_config = self.generate_tls_config(tls_params)
+        server_tokens = self.get_server_tokens(tls_params)
+        
+        return BASE_TEMPLATE.format(
+            server_tokens=server_tokens,
+            tls_config=tls_config,
+            error_config=errors,
+            body_component=body_component
+        )
+    
+
+    def get_cached_config(self, body_hash: str, header_hash: str, tls_params: Dict[str, Any]) -> str:
+        """Get configuration with caching."""
+        cache_key = f"{body_hash}-{header_hash}-{json.dumps(tls_params, sort_keys=True)}"
+        
+        if cache_key in self._config_cache:
+            return self._config_cache[cache_key]
+        
+        config = self.generate_config(body_hash, header_hash, tls_params)
+        self._config_cache[cache_key] = config
         return config
     
-    def get_server_name(self, config_id):
-        """Get server name - can be overridden"""
-        return f"{config_id}.internal.com"
-    
-    def get_server_tokens(self):
-        """Get the server tokens"""        
-        return f"server_tokens on;" if self.server_tokens else f"server_tokens off;" 
-    
-    def get_listen_directive(self):
-        """Get listen directive - can be overridden"""
-        return f"listen {self.default_port};"
-    
-    def get_ssl_config(self, config_id, custom_data):
-        """Get SSL configuration if needed"""
-        if self.default_port == 443:
-            return f"""    ssl_certificate /etc/ssl/certs/{config_id}.crt;
-    ssl_certificate_key /etc/ssl/private/{config_id}.key;
-    
-    {custom_data}"""
-        #add the custom secure config here
-        return ""
-    
-    def get_common_directives(self):
-        """Common directives that most configs share"""
-        directives = []
-        
-        if self.enable_gzip:
-            directives.append("""    # Gzip compression
-    gzip on;
-    gzip_types text/css text/javascript application/javascript application/json;""")
-        
-        if self.enable_security_headers:
-            directives.append("""    # Security headers
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";""")
-        
-        return "\n".join(directives)
-    
-    @abstractmethod
-    def get_location_blocks(self, config_id):
-        """Each config type must define its location blocks"""
-        pass
 
-class SecureConfig(BaseConfig, HeaderMixin):
-    """API Server with minimal customization"""
+    def clear_cache(self):
+        """Clear the configuration cache."""
+        self._config_cache.clear()
     
-    def __init__(self):
-        super().__init__()
-        self.default_port = 443  # Override to use SSL
     
-    @property
-    def config_type(self):
-        return "404"
-    
-    def get_error_config(self):
-        test = self.process_headers_for_config(headers, 'test')
-        return f"""error handling"""
-    
-    def get_server_name(self, config_id):
-        return f"api-{config_id}.internal.com"
-    
-    def get_location_blocks(self, config_id):
-        return f"""    location /api/ {{
-        proxy_pass http://api_backend_{config_id};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+    def add_body_component(self, body_hash: str, component_type: str, params: List[Any]):
+        """Add a new body component mapping."""
+        if component_type not in self.body_component_generators:
+            raise ValueError(f"Unknown component type: {component_type}")
         
-        # API specific settings
-        proxy_read_timeout 300s;
-        proxy_connect_timeout 75s;
-    }}
-    
-    location /health {{
-        access_log off;
-        return 200 "healthy\\n";
-        add_header Content-Type text/plain;
-    }}"""
+        self.body_hash_map[body_hash] = {
+            "type": component_type,
+            "params": params
+        }
 
-class SecureConfigExternal(SecureConfig):
-    """API Server with minimal customization"""
-    
-    def __init__(self):
-        super().__init__()
-        self.server_tokens = True  
-    
 
-class StaticSiteConfig(BaseConfig):
-    """Static site with just location customization"""
-    
-    @property
-    def config_type(self):
-        return "static_site"
-    
-    def get_server_name(self, config_id):
-        return f"site-{config_id}.internal.com"
-    
-    def get_location_blocks(self, config_id):
-        return f"""    root /var/www/{config_id};
-    index index.html index.htm;
-    
-    location / {{
-        try_files $uri $uri/ =404;
-    }}
-    
-    location ~* \\.(css|js|png|jpg|jpeg|gif|ico|svg)$ {{
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }}
-    
-    location = /favicon.ico {{
-        log_not_found off;
-        access_log off;
-    }}"""
+    def add_header_config(self, header_hash: str, config: str):
+        """Add a new header configuration."""
+        self.header_configs[header_hash] = config
 
-class DatabaseProxyConfig(BaseConfig):
-    """Database proxy with SSL and custom timeouts"""
-    
-    def __init__(self):
-        super().__init__()
-        self.default_port = 443
-        self.enable_gzip = False  # Disable gzip for database connections
-    
-    @property
-    def config_type(self):
-        return "database_proxy"
-    
-    def get_upstream_config(self, config_id):
-        return f"""upstream db_backend_{config_id} {{
-    server 10.0.2.10:5432;
-    server 10.0.2.11:5432 backup;
-}}"""
-    
-    def get_server_name(self, config_id):
-        return f"db-{config_id}.internal.com"
-    
-    def get_location_blocks(self, config_id):
-        return f"""    location / {{
-        proxy_pass http://db_backend_{config_id};
-        proxy_set_header Host $host;
-        
-        # Database specific settings
-        proxy_read_timeout 600s;
-        proxy_connect_timeout 10s;
-        proxy_send_timeout 600s;
-    }}"""
 
-class NginxConfigGenerator:
-    """Main generator class that manages all config types"""
+if __name__ == "__main__":
+    generator = ConfigGenerator()
     
-    def __init__(self):
-        self.configs = {}
-        self.generated_configs = []
+    config1 = generator.generate_config(
+        body_hash="001",  
+        header_hash="001",  
+        tls_params={
+            "domain": "example.com",
+            "ssl_protocols": "TLSv1.3",
+            "hsts_enabled": True,
+            "server tokens": True
+        }
+    )
     
-    def register_config(self, config_id, config_class):
-        """Register a config class with IP lookup file"""
-        if not issubclass(config_class, BaseConfig):
-            raise TypeError("Config class must inherit from BaseConfig")
-        
-        self.configs[config_id] = config_class()
-    
-    def bulk_register(self, config_mapping):
-        """Register multiple configs at once"""
-        for config_id, config_class in config_mapping.items():
-            self.register_config(config_id, config_class)
-    
-    def generate(self, config_id, jarm, body_hash, custom_data):
-        """Generate co+nfig for a specific ID"""
-        if config_id not in self.configs:
-            raise ValueError(f"No config registered for ID: {config_id}")
-        
-        config_content = self.configs[config_id].generate(config_id, custom_data)
-        config_type = self.configs[config_id].config_type        
-        config = {
-            'id': config_id,
-            'type': config_type,
-            'content': config_content,
-            'jarm': jarm,
-            'body_hash': body_hash,
-            'extra_data': custom_data
-        }  
-        self.generated_configs.append(config)
-
-    
-    def save_configs(self, output_dir="nginx_configs"):
-        """Save all generated configs to separate files"""
-        output_path = Path(output_dir)
-        output_path.mkdir(exist_ok=True)
-        
-        for config in self.generated_configs:
-            filename = f"BH:{config['id']}_JARM:{config['jarm']}_HH:{config['body_hash']}_{config['type']}.conf"
-            filepath = output_path / filename
-            
-            with open(filepath, 'w') as f:
-                f.write(config['content'])
-            
-            print(f"Saved: {filepath}")
-
+    print(config1)
